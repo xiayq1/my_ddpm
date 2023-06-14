@@ -14,7 +14,7 @@ def create_argparser():
     defaults = dict(
         learning_rate=1e-4, # 2e-4
         batch_size=256, # 128
-        iterations=50000, # 800000
+        iterations=80000, # 800000
 
         log_rate=1000,
         checkpoint_rate=5000,

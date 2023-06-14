@@ -7,6 +7,7 @@ from functools import partial
 from copy import deepcopy
 
 from ema import EMA
+# from .utils import extract
 
 def extract(a, t, x_shape):
     b, *_ = t.shape
@@ -78,6 +79,9 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer("sqrt_one_minus_alphas_cumprod", to_torch(np.sqrt(1 - alphas_cumprod)))
         self.register_buffer("reciprocal_sqrt_alphas", to_torch(np.sqrt(1 / alphas)))
 
+        # self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod)))
+        # self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod - 1)))
+
         self.register_buffer("remove_noise_coeff", to_torch(betas / np.sqrt(1 - alphas_cumprod)))
         self.register_buffer("sigma", to_torch(np.sqrt(betas)))
 
@@ -93,24 +97,30 @@ class GaussianDiffusion(nn.Module):
     def remove_noise(self, x, t, y, use_ema=True):
         if use_ema:
             return (
-                (x - extract(self.remove_noise_coeff, t, x.shape) * self.ema_model(x, t, y)) *
-                extract(self.reciprocal_sqrt_alphas, t, x.shape)
+                (x - extract(self.remove_noise_coeff, t, x.shape) * self.ema_model(x, t, y)) * extract(self.reciprocal_sqrt_alphas, t, x.shape)
             )
         else:
             # xt-1 = (xt - w *  model(x, t)) * w2 + sigma(no add here)
             return (
-                (x - extract(self.remove_noise_coeff, t, x.shape) * self.model(x, t, y)) *
-                extract(self.reciprocal_sqrt_alphas, t, x.shape)
+                (x - extract(self.remove_noise_coeff, t, x.shape) * self.model(x, t, y)) * extract(self.reciprocal_sqrt_alphas, t, x.shape)
             )
 
     @torch.no_grad()
-    def sample(self, batch_size, device, y=None, use_ema=True):
+    def sample(self, batch_size, device, y=None, use_ema=True, sampling_timesteps=None):
         if y is not None and batch_size != len(y):
             raise ValueError("sample batch size different from length of given y")
 
         x = torch.randn(batch_size, self.img_channels, *self.img_size, device=device)
         
-        for t in range(self.num_timesteps - 1, -1, -1):
+        if sampling_timesteps is None:
+            sampling_timesteps = self.num_timesteps
+        
+        times = torch.linspace(-1, self.num_timesteps - 1, steps = sampling_timesteps + 1)
+        times = list(reversed(times.int().tolist()))
+        print(len(times))
+        # for t in range(self.num_timesteps - 1, -1, -1):
+        for t in times[:-1]:
+            print(t)
             t_batch = torch.tensor([t], device=device).repeat(batch_size)
             x = self.remove_noise(x, t_batch, y, use_ema)
 
@@ -119,6 +129,71 @@ class GaussianDiffusion(nn.Module):
                 x += extract(self.sigma, t_batch, x.shape) * torch.randn_like(x)
         
         return x.cpu().detach()
+    
+    def predict_start_from_noise(self, x_t, t, noise):
+        # to_torch = partial(torch.tensor, dtype=torch.float32)
+        self.sqrt_recip_alphas_cumprod = torch.sqrt(1. / self.alphas_cumprod)
+        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1. / self.alphas_cumprod - 1)
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+    
+    def predict_noise_from_start(self, x_t, t, x0):
+        return (
+            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        )
+    
+    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
+        model_output = self.model(x, t, x_self_cond)
+        maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
+
+
+        pred_noise = model_output
+        x_start = self.predict_start_from_noise(x, t, pred_noise)
+        x_start = maybe_clip(x_start)
+
+        # if clip_x_start and rederive_pred_noise:
+        #     pred_noise = self.predict_noise_from_start(x, t, x_start)
+
+        return pred_noise, x_start
+    
+    @torch.no_grad()
+    def sample_ddim(self, batch_size, device, y=None, use_ema=True, sampling_timesteps=None):
+        if y is not None and batch_size != len(y):
+            raise ValueError("sample batch size different from length of given y")
+
+        img = torch.randn(batch_size, self.img_channels, *self.img_size, device=device)
+        
+        if sampling_timesteps is None:
+            sampling_timesteps = self.num_timesteps
+        
+        times = torch.linspace(-1, self.num_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:]))
+
+        for time, time_next in time_pairs:
+            time_cond = torch.full((batch_size,), time, device = device, dtype = torch.long)
+            self_cond = y
+            pred_noise, x_start = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
+
+            if time_next < 0:
+                img = x_start
+                continue
+            
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+
+            eta = 0
+
+            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(img)
+
+            img = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
+            
+        return img.cpu().detach()
 
     @torch.no_grad()
     def sample_diffusion_sequence(self, batch_size, device, y=None, use_ema=True):

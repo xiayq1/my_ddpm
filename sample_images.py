@@ -18,7 +18,7 @@ def main():
             for label in range(10):
                 y = torch.ones(args.num_images // 10, dtype=torch.long, device=device) * label
                 # samples = diffusion.sample(args.num_images // 10, device, y=y)
-                sampling_timesteps = 50
+                sampling_timesteps = 1000
                 # samples = diffusion.sample(args.num_images // 10, device, y=y, sampling_timesteps=sampling_timesteps)
                 samples = diffusion.sample_ddim(args.num_images // 10, device, y=y, sampling_timesteps=sampling_timesteps)
 
